@@ -10,17 +10,70 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-func handlePause(gs *gamelogic.GameState) func(routing.PlayingState) {
-	return func(ps routing.PlayingState) {
+func handlePause(gs *gamelogic.GameState) func(routing.PlayingState) pubsub.AckType {
+	return func(ps routing.PlayingState) pubsub.AckType {
 		defer fmt.Print("> ")
 		gs.HandlePause(ps)
+		return pubsub.Ack
 	}
 }
 
-func handleMove(gs *gamelogic.GameState) func(gamelogic.ArmyMove) {
-	return func(am gamelogic.ArmyMove) {
+func handleWar(gs *gamelogic.GameState) func(gamelogic.RecognitionOfWar) pubsub.AckType {
+	return func(rw gamelogic.RecognitionOfWar) pubsub.AckType {
 		defer fmt.Print("> ")
-		gs.HandleMove(am)
+		outcome, _, _ := gs.HandleWar(rw)
+		switch outcome {
+
+		case gamelogic.WarOutcomeNotInvolved:
+			return pubsub.NackRequeue
+
+		case gamelogic.WarOutcomeNoUnits:
+			return pubsub.NackDiscard
+
+		case gamelogic.WarOutcomeOpponentWon:
+			return pubsub.Ack
+
+		case gamelogic.WarOutcomeYouWon:
+			return pubsub.Ack
+
+		case gamelogic.WarOutcomeDraw:
+			return pubsub.Ack
+
+		default:
+			fmt.Printf("Error: unknown war outcome: %v\n", outcome)
+			return pubsub.NackDiscard
+		}
+	}
+}
+
+func handleMove(connCh *amqp.Channel, gs *gamelogic.GameState) func(gamelogic.ArmyMove) pubsub.AckType {
+	return func(am gamelogic.ArmyMove) pubsub.AckType {
+		defer fmt.Print("> ")
+		moveOutcome := gs.HandleMove(am)
+		switch moveOutcome {
+
+		case gamelogic.MoveOutComeSafe:
+			return pubsub.Ack
+
+		case gamelogic.MoveOutcomeMakeWar:
+			routingKey := fmt.Sprintf("%s.%s", routing.WarRecognitionsPrefix, gs.GetUsername())
+			err := pubsub.PublishJSON(
+				connCh,
+				routing.ExchangePerilTopic,
+				routingKey,
+				gamelogic.RecognitionOfWar{
+					Attacker: am.Player,
+					Defender: gs.GetPlayerSnap(),
+				},
+			)
+			if err != nil {
+				return pubsub.NackDiscard
+			}
+			return pubsub.NackRequeue
+
+		default:
+			return pubsub.NackDiscard
+		}
 	}
 }
 
@@ -34,6 +87,11 @@ func main() {
 	}
 	defer conn.Close()
 
+	connCh, err := conn.Channel()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	fmt.Println("Connected to Peril server!")
 
 	username, err := gamelogic.ClientWelcome()
@@ -42,19 +100,7 @@ func main() {
 	}
 
 	queueName := fmt.Sprintf("%s.%s", routing.PauseKey, username)
-	_, _, err = pubsub.DeclareAndBind(
-		conn,
-		routing.ExchangePerilDirect,
-		queueName,
-		routing.PauseKey,
-		pubsub.Transient,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	gameState := gamelogic.NewGameState(username)
-
 	err = pubsub.SubscribeJSON(
 		conn,
 		routing.ExchangePerilDirect,
@@ -69,25 +115,27 @@ func main() {
 
 	armyMoveRoutingKey := fmt.Sprintf("%s.%s", routing.ArmyMovesPrefix, "*")
 	armyMoveQueue := fmt.Sprintf("%s.%s", routing.ArmyMovesPrefix, username)
-
-	connCh, _, err := pubsub.DeclareAndBind(
-		conn,
-		routing.ExchangePerilTopic,
-		armyMoveQueue,
-		armyMoveRoutingKey,
-		pubsub.Transient,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	err = pubsub.SubscribeJSON(
 		conn,
 		routing.ExchangePerilTopic,
 		armyMoveQueue,
 		armyMoveRoutingKey,
 		pubsub.Transient,
-		handleMove(gameState),
+		handleMove(connCh, gameState),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	warRoutingKey := fmt.Sprintf("%s.%s", routing.WarRecognitionsPrefix, "*")
+	warQueue := routing.WarRecognitionsPrefix
+	err = pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilTopic,
+		warQueue,
+		warRoutingKey,
+		pubsub.Durable,
+		handleWar(gameState),
 	)
 	if err != nil {
 		log.Fatal(err)
